@@ -2,6 +2,7 @@ package sled
 
 import "errors"
 
+// Sentinel errors returned by the store and its transactions.
 var (
 	// ErrClosed is returned when an operation is attempted on a database that
 	// has already been closed.
