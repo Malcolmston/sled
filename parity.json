@@ -1,0 +1,10 @@
+{
+  "repo": "sled",
+  "upstream": "spacejam/sled",
+  "parityBefore": "90%",
+  "parityAfter": "100%",
+  "upstreamCasesSynced": 30,
+  "gapsFound": 3,
+  "gapsClosed": 3,
+  "asOf": "2026-07-18"
+}

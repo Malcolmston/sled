@@ -392,6 +392,10 @@ func (db *DB) ContainsKey(key []byte) (bool, error) { return db.def.ContainsKey(
 // Clear removes every key from the default tree. See [Tree.Clear].
 func (db *DB) Clear() error { return db.def.Clear() }
 
+// IsEmpty reports whether the default tree contains no keys. It mirrors sled's
+// Tree::is_empty and is equivalent to db.Len() == 0.
+func (db *DB) IsEmpty() bool { return db.def.IsEmpty() }
+
 // First returns the smallest key and value in the default tree. See
 // [Tree.First].
 func (db *DB) First() (key, value []byte, ok bool) { return db.def.First() }
