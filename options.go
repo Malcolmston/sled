@@ -7,6 +7,7 @@ import "os"
 type options struct {
 	syncWrites bool
 	fileMode   os.FileMode
+	temporary  bool
 }
 
 func defaultOptions() options {
@@ -32,4 +33,13 @@ func WithSyncWrites(sync bool) Option {
 // The default is 0o644.
 func WithFileMode(mode os.FileMode) Option {
 	return func(o *options) { o.fileMode = mode }
+}
+
+// WithTemporary marks the database as temporary. A temporary database behaves
+// exactly like a normal one while open, but its backing log file (and any
+// leftover compaction file) is deleted when [DB.Close] returns successfully.
+// This mirrors sled's Config::temporary and is convenient for tests and
+// short-lived scratch stores. It is disabled by default.
+func WithTemporary(temporary bool) Option {
+	return func(o *options) { o.temporary = temporary }
 }

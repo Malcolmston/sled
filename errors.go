@@ -38,4 +38,8 @@ var (
 	// ErrCorruptImport is returned by Import when the stream's magic or checksum
 	// does not verify, or its framing is invalid. Nothing is applied.
 	ErrCorruptImport = errors.New("sled: corrupt or truncated import stream")
+
+	// ErrNoPath is returned by Config.Open when no database path has been set on
+	// the Config.
+	ErrNoPath = errors.New("sled: no database path configured")
 )

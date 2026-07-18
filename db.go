@@ -46,6 +46,11 @@ type DB struct {
 	idNext     uint64
 	idReserved uint64
 
+	// recovered reports whether Open found an existing, non-empty log and
+	// rebuilt state from it rather than creating a fresh database. It is set once
+	// during Open and read by [DB.WasRecovered].
+	recovered bool
+
 	closed atomic.Bool
 }
 
@@ -73,6 +78,12 @@ func Open(path string, opts ...Option) (*DB, error) {
 
 	db := &DB{log: f, opts: o, path: path, trees: make(map[string]*Tree)}
 	db.def = db.getOrCreateTree(DefaultTreeName)
+
+	// A non-empty file at open time means we are recovering an existing
+	// database rather than creating a new one. Record it before replay.
+	if fi, err := f.Stat(); err == nil {
+		db.recovered = fi.Size() > 0
+	}
 
 	// Rebuild every tree by replaying the log. Replay is single-threaded, so it
 	// mutates roots and bookkeeping directly without locking.
@@ -157,7 +168,15 @@ func (db *DB) Close() error {
 		_ = db.log.Close()
 		return fmt.Errorf("sled: sync on close: %w", err)
 	}
-	return db.log.Close()
+	if err := db.log.Close(); err != nil {
+		return err
+	}
+	// A temporary database removes its backing files once it is cleanly closed.
+	if db.opts.temporary {
+		_ = os.Remove(db.path)
+		_ = os.Remove(db.path + ".compact")
+	}
+	return nil
 }
 
 // treeUpdate pairs a tree with the new root the commit will publish for it.
