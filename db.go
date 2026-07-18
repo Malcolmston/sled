@@ -8,11 +8,23 @@ import (
 	"sync/atomic"
 )
 
+// DefaultTreeName is the name of the always-present default keyspace, the one
+// backing the DB's own Set/Get/Delete/Scan methods. Passing it to [DB.OpenTree]
+// returns that same default tree, and it appears in [DB.TreeNames]. It cannot be
+// dropped.
+const DefaultTreeName = "__sled__default"
+
 // DB is an embedded, transactional key/value store backed by an append-only
 // write-ahead log. A DB is safe for concurrent use: a single writer is
 // serialized internally while any number of readers proceed concurrently
 // against immutable snapshots. See the package documentation for the full
 // concurrency and durability model.
+//
+// A DB holds one or more independent, ordered keyspaces called trees. The
+// default tree backs the DB's own Set/Get/Delete/Scan methods; additional named
+// trees are obtained with [DB.OpenTree]. All trees share the single write-ahead
+// log and the single writer slot, which is what lets a transaction span several
+// trees atomically.
 type DB struct {
 	// mu serializes all writers (single-writer model) and protects the log
 	// file and the mutable bookkeeping fields below.
@@ -21,9 +33,18 @@ type DB struct {
 	opts options
 	path string
 
-	// root is the current published index snapshot. It is read by readers with
-	// an atomic load (no lock) and replaced by the writer with an atomic store.
-	root atomic.Pointer[node]
+	// treesMu guards the trees registry. Individual tree roots are published
+	// atomically and read without any lock; treesMu only covers adding, finding
+	// and removing tree handles.
+	treesMu sync.RWMutex
+	trees   map[string]*Tree
+	def     *Tree
+
+	// idNext is the next identifier GenerateID will hand out; idReserved is the
+	// durable high-water mark below which identifiers have been reserved on
+	// disk. Both are protected by mu.
+	idNext     uint64
+	idReserved uint64
 
 	closed atomic.Bool
 }
@@ -50,19 +71,16 @@ func Open(path string, opts ...Option) (*DB, error) {
 		return nil, fmt.Errorf("sled: open log: %w", err)
 	}
 
-	db := &DB{log: f, opts: o, path: path}
+	db := &DB{log: f, opts: o, path: path, trees: make(map[string]*Tree)}
+	db.def = db.getOrCreateTree(DefaultTreeName)
 
-	// Rebuild the index by replaying the log into a fresh tree.
-	var root *node
-	goodEnd, err := replay(f, func(ops []op) error {
-		root = applyOps(root, ops)
-		return nil
-	})
+	// Rebuild every tree by replaying the log. Replay is single-threaded, so it
+	// mutates roots and bookkeeping directly without locking.
+	goodEnd, err := replay(f, db.replayOps)
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("sled: replay log: %w", err)
 	}
-	db.root.Store(root)
 
 	// Discard any partial/corrupt tail left by a crash so future appends stay
 	// contiguous and a subsequent Open replays cleanly.
@@ -91,18 +109,39 @@ func Open(path string, opts ...Option) (*DB, error) {
 	return db, nil
 }
 
-// applyOps folds a group of operations onto an index snapshot, returning the
-// resulting snapshot. It is used both during replay and on the commit path.
-func applyOps(root *node, ops []op) *node {
+// replayOps applies a group of operations during log replay, routing each to
+// its target tree and updating durable bookkeeping. It runs single-threaded
+// from Open, so it stores roots directly.
+func (db *DB) replayOps(ops []op) error {
 	for _, o := range ops {
 		switch o.kind {
-		case opSet:
-			root = insert(root, o.key, o.value)
-		case opDelete:
-			root = remove(root, o.key)
+		case opSet, opTreeSet:
+			t := db.getOrCreateTree(treeName(o.tree))
+			t.root.Store(insert(t.root.Load(), o.key, o.value))
+		case opDelete, opTreeDelete:
+			t := db.getOrCreateTree(treeName(o.tree))
+			t.root.Store(remove(t.root.Load(), o.key))
+		case opClearTree:
+			db.getOrCreateTree(treeName(o.tree)).root.Store(nil)
+		case opDropTree:
+			delete(db.trees, treeName(o.tree))
+		case opIDReserve:
+			if o.num > db.idReserved {
+				db.idReserved = o.num
+				db.idNext = o.num
+			}
 		}
 	}
-	return root
+	return nil
+}
+
+// treeName maps a raw op tree field to a registry key. Legacy tree-less ops
+// (opSet/opDelete) carry an empty tree and belong to the default tree.
+func treeName(raw string) string {
+	if raw == "" {
+		return DefaultTreeName
+	}
+	return raw
 }
 
 // Close flushes any buffered data, fsyncs the log and releases the underlying
@@ -121,12 +160,19 @@ func (db *DB) Close() error {
 	return db.log.Close()
 }
 
+// treeUpdate pairs a tree with the new root the commit will publish for it.
+type treeUpdate struct {
+	tree *Tree
+	root *node
+}
+
 // commit is the single durable write primitive. It appends one record holding
-// ops to the log, optionally fsyncs, and then atomically publishes newRoot as
-// the current index. The caller must hold db.mu. If the log write fails the
-// in-memory index is left untouched so on-disk and in-memory state stay
-// consistent.
-func (db *DB) commit(ops []op, newRoot *node) error {
+// ops to the log, optionally fsyncs, then atomically publishes each update's new
+// root and delivers events to matching subscribers. The caller must hold db.mu.
+// If the log write fails no root is published, so on-disk and in-memory state
+// stay consistent. Publishing all updates from one record is what makes a
+// multi-tree transaction atomic.
+func (db *DB) commit(ops []op, updates []treeUpdate, events []Event) error {
 	if db.closed.Load() {
 		return ErrClosed
 	}
@@ -139,72 +185,36 @@ func (db *DB) commit(ops []op, newRoot *node) error {
 			return fmt.Errorf("sled: fsync: %w", err)
 		}
 	}
-	db.root.Store(newRoot)
+	for _, u := range updates {
+		u.tree.root.Store(u.root)
+	}
+	for i := range events {
+		events[i].tree.publish(events[i])
+	}
 	return nil
 }
 
-// snapshot returns the current immutable index root without locking.
-func (db *DB) snapshot() *node { return db.root.Load() }
+// Set stores value under key in the default tree, replacing any previous value.
+// The key and value are copied, so the caller may reuse their buffers after Set
+// returns.
+func (db *DB) Set(key, value []byte) error { return db.def.Set(key, value) }
 
-// Set stores value under key, replacing any previous value. The key and value
-// are copied, so the caller may reuse their buffers after Set returns.
-func (db *DB) Set(key, value []byte) error {
-	if len(key) == 0 {
-		return ErrEmptyKey
-	}
-	o := op{kind: opSet, key: cloneBytes(key), value: cloneBytes(value)}
+// Delete removes key from the default tree. Deleting a key that does not exist
+// is not an error.
+func (db *DB) Delete(key []byte) error { return db.def.Delete(key) }
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed.Load() {
-		return ErrClosed
-	}
-	newRoot := insert(db.snapshot(), o.key, o.value)
-	return db.commit([]op{o}, newRoot)
-}
+// Get returns the value stored under key in the default tree and whether the key
+// was present. A present key with an empty value returns (nil-or-empty, true,
+// nil); an absent key returns (nil, false, nil). The returned slice is owned by
+// the DB and must not be modified by the caller.
+func (db *DB) Get(key []byte) ([]byte, bool, error) { return db.def.Get(key) }
 
-// Delete removes key. Deleting a key that does not exist is not an error.
-func (db *DB) Delete(key []byte) error {
-	if len(key) == 0 {
-		return ErrEmptyKey
-	}
-	o := op{kind: opDelete, key: cloneBytes(key)}
+// Has reports whether key is present in the default tree.
+func (db *DB) Has(key []byte) (bool, error) { return db.def.Has(key) }
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed.Load() {
-		return ErrClosed
-	}
-	newRoot := remove(db.snapshot(), o.key)
-	return db.commit([]op{o}, newRoot)
-}
-
-// Get returns the value stored under key and whether the key was present. A
-// present key with an empty value returns (nil-or-empty, true, nil); an absent
-// key returns (nil, false, nil). The returned slice is owned by the DB and must
-// not be modified by the caller.
-func (db *DB) Get(key []byte) ([]byte, bool, error) {
-	if db.closed.Load() {
-		return nil, false, ErrClosed
-	}
-	v, ok := get(db.snapshot(), key)
-	return v, ok, nil
-}
-
-// Has reports whether key is present.
-func (db *DB) Has(key []byte) (bool, error) {
-	if db.closed.Load() {
-		return false, ErrClosed
-	}
-	_, ok := get(db.snapshot(), key)
-	return ok, nil
-}
-
-// Len returns the number of live keys. It is O(n) and intended for reporting
-// and tests rather than hot-path use.
-func (db *DB) Len() int {
-	return count(db.snapshot())
-}
+// Len returns the number of live keys in the default tree. It is O(n) and
+// intended for reporting and tests rather than hot-path use.
+func (db *DB) Len() int { return db.def.Len() }
 
 // Path returns the path of the database's log file.
 func (db *DB) Path() string { return db.path }

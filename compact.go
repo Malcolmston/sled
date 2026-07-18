@@ -26,7 +26,14 @@ func (db *DB) Compact() (err error) {
 		return ErrClosed
 	}
 
-	root := db.snapshot()
+	// Snapshot every tree so the rewrite reproduces the whole database.
+	db.treesMu.RLock()
+	trees := make([]*Tree, 0, len(db.trees))
+	for _, t := range db.trees {
+		trees = append(trees, t)
+	}
+	db.treesMu.RUnlock()
+
 	tmpPath := db.path + ".compact"
 
 	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, db.opts.fileMode)
@@ -42,7 +49,8 @@ func (db *DB) Compact() (err error) {
 		}
 	}()
 
-	// Walk the live key set in order, writing Set records in bounded groups.
+	// Walk each tree's live key set in order, writing Set records in bounded
+	// groups.
 	batch := make([]op, 0, compactRecordKeys)
 	flush := func() error {
 		if len(batch) == 0 {
@@ -55,18 +63,26 @@ func (db *DB) Compact() (err error) {
 		return nil
 	}
 
+	// Preserve the GenerateID high-water mark so identifiers stay monotonic
+	// across a compaction.
+	if db.idReserved > 0 {
+		batch = append(batch, op{kind: opIDReserve, num: db.idReserved})
+	}
+
 	var walkErr error
-	inorder(root, func(n *node) bool {
-		batch = append(batch, op{kind: opSet, key: n.key, value: n.value})
-		if len(batch) >= compactRecordKeys {
-			if walkErr = flush(); walkErr != nil {
-				return false
+	for _, t := range trees {
+		inorder(t.snapshot(), func(n *node) bool {
+			batch = append(batch, t.setOp(n.key, n.value))
+			if len(batch) >= compactRecordKeys {
+				if walkErr = flush(); walkErr != nil {
+					return false
+				}
 			}
+			return true
+		})
+		if walkErr != nil {
+			return walkErr
 		}
-		return true
-	})
-	if walkErr != nil {
-		return walkErr
 	}
 	if err := flush(); err != nil {
 		return err

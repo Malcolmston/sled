@@ -13,15 +13,37 @@ import (
 type opKind uint8
 
 const (
+	// opSet and opDelete are the original, tree-less record kinds. They target
+	// the default keyspace and carry no tree name, keeping logs written by
+	// earlier versions replayable byte-for-byte.
 	opSet    opKind = 1
 	opDelete opKind = 2
+
+	// opTreeSet and opTreeDelete target a named tree; they carry the tree name
+	// ahead of the key (and, for a set, the value).
+	opTreeSet    opKind = 3
+	opTreeDelete opKind = 4
+
+	// opDropTree removes an entire named tree; opClearTree empties one while
+	// leaving it registered. Both carry only a tree name.
+	opDropTree  opKind = 5
+	opClearTree opKind = 6
+
+	// opIDReserve records a durable high-water mark for GenerateID so that
+	// identifiers stay monotonic across restarts. It carries only a number.
+	opIDReserve opKind = 7
 )
 
-// op is a single mutation. For opDelete, value is nil.
+// op is a single mutation stored in the log. Its meaningful fields depend on
+// kind: opDelete/opTreeDelete carry no value, opDropTree/opClearTree carry only
+// tree, and opIDReserve carries only num. The tree field is the empty string
+// for the default keyspace and a tree name otherwise.
 type op struct {
 	kind  opKind
+	tree  string
 	key   []byte
 	value []byte
+	num   uint64
 }
 
 // maxRecordPayload bounds the size of a single decoded record. It guards
@@ -43,15 +65,31 @@ func encodeRecord(ops []op) []byte {
 	n := binary.PutUvarint(scratch[:], uint64(len(ops)))
 	payload = append(payload, scratch[:n]...)
 
+	putBytes := func(b []byte) {
+		n = binary.PutUvarint(scratch[:], uint64(len(b)))
+		payload = append(payload, scratch[:n]...)
+		payload = append(payload, b...)
+	}
+
 	for _, o := range ops {
 		payload = append(payload, byte(o.kind))
-		n = binary.PutUvarint(scratch[:], uint64(len(o.key)))
-		payload = append(payload, scratch[:n]...)
-		payload = append(payload, o.key...)
-		if o.kind == opSet {
-			n = binary.PutUvarint(scratch[:], uint64(len(o.value)))
+		switch o.kind {
+		case opSet, opDelete:
+			putBytes(o.key)
+			if o.kind == opSet {
+				putBytes(o.value)
+			}
+		case opTreeSet, opTreeDelete:
+			putBytes([]byte(o.tree))
+			putBytes(o.key)
+			if o.kind == opTreeSet {
+				putBytes(o.value)
+			}
+		case opDropTree, opClearTree:
+			putBytes([]byte(o.tree))
+		case opIDReserve:
+			n = binary.PutUvarint(scratch[:], o.num)
 			payload = append(payload, scratch[:n]...)
-			payload = append(payload, o.value...)
 		}
 	}
 
@@ -80,20 +118,43 @@ func decodePayload(payload []byte) ([]op, error) {
 			return nil, err
 		}
 		kind := opKind(kindByte)
-		if kind != opSet && kind != opDelete {
-			return nil, fmt.Errorf("sled: unknown op kind %d", kindByte)
-		}
-		key, err := r.bytes()
-		if err != nil {
-			return nil, err
-		}
-		o := op{kind: kind, key: key}
-		if kind == opSet {
-			val, err := r.bytes()
+		o := op{kind: kind}
+		switch kind {
+		case opSet, opDelete:
+			if o.key, err = r.bytes(); err != nil {
+				return nil, err
+			}
+			if kind == opSet {
+				if o.value, err = r.bytes(); err != nil {
+					return nil, err
+				}
+			}
+		case opTreeSet, opTreeDelete:
+			tree, err := r.bytes()
 			if err != nil {
 				return nil, err
 			}
-			o.value = val
+			o.tree = string(tree)
+			if o.key, err = r.bytes(); err != nil {
+				return nil, err
+			}
+			if kind == opTreeSet {
+				if o.value, err = r.bytes(); err != nil {
+					return nil, err
+				}
+			}
+		case opDropTree, opClearTree:
+			tree, err := r.bytes()
+			if err != nil {
+				return nil, err
+			}
+			o.tree = string(tree)
+		case opIDReserve:
+			if o.num, err = r.uvarint(); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("sled: unknown op kind %d", kindByte)
 		}
 		ops = append(ops, o)
 	}

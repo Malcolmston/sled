@@ -69,8 +69,22 @@ func (b *Batch) Commit() error {
 	if db.closed.Load() {
 		return ErrClosed
 	}
-	newRoot := applyOps(db.snapshot(), b.ops)
-	return db.commit(b.ops, newRoot)
+	t := db.def
+	root := t.snapshot()
+	events := make([]Event, 0, len(b.ops))
+	for _, o := range b.ops {
+		switch o.kind {
+		case opSet:
+			events = append(events, Event{Type: eventKind(root, o.key, false), tree: t, Key: o.key, Value: o.value})
+			root = insert(root, o.key, o.value)
+		case opDelete:
+			if _, ok := get(root, o.key); ok {
+				events = append(events, Event{Type: EventDelete, tree: t, Key: o.key})
+			}
+			root = remove(root, o.key)
+		}
+	}
+	return db.commit(b.ops, []treeUpdate{{t, root}}, events)
 }
 
 // Batch is a convenience that stages writes via fn into a fresh Batch and

@@ -10,18 +10,21 @@ import "bytes"
 //     skipped. A nil Upper means unbounded above.
 //   - Prefix restricts the scan to keys that begin with Prefix. It composes
 //     with Lower/Upper (the effective range is the intersection).
+//   - Reverse iterates the range in descending key order instead of ascending.
+//     The bounds are interpreted identically; only the visiting order changes.
 //
 // The zero Range scans every key in ascending order.
 type Range struct {
-	Lower  []byte
-	Upper  []byte
-	Prefix []byte
+	Lower   []byte
+	Upper   []byte
+	Prefix  []byte
+	Reverse bool
 }
 
-// Iterator yields key/value pairs in ascending key order over an immutable
-// snapshot. Because the snapshot never changes, an Iterator is unaffected by
-// concurrent writes. Keys and values returned by the iterator are owned by the
-// DB and must not be modified.
+// Iterator yields key/value pairs in key order (ascending, or descending when
+// the range is reversed) over an immutable snapshot. Because the snapshot never
+// changes, an Iterator is unaffected by concurrent writes. Keys and values
+// returned by the iterator are owned by the DB and must not be modified.
 //
 // Typical use:
 //
@@ -33,15 +36,18 @@ type Range struct {
 //		it.Next()
 //	}
 type Iterator struct {
-	stack  []*node
-	upper  []byte
-	prefix []byte
-	cur    *node
+	stack   []*node
+	lower   []byte
+	upper   []byte
+	prefix  []byte
+	reverse bool
+	cur     *node
 }
 
-// Scan returns an iterator over the current snapshot restricted to r.
+// Scan returns an iterator over the default tree restricted to r. Set r.Reverse
+// for descending order.
 func (db *DB) Scan(r Range) *Iterator {
-	return newIterator(db.snapshot(), r)
+	return newIterator(db.def.snapshot(), r)
 }
 
 func newIterator(root *node, r Range) *Iterator {
@@ -57,8 +63,12 @@ func newIterator(root *node, r Range) *Iterator {
 			}
 		}
 	}
-	it := &Iterator{upper: upper, prefix: r.Prefix}
-	it.seek(root, lower)
+	it := &Iterator{lower: lower, upper: upper, prefix: r.Prefix, reverse: r.Reverse}
+	if it.reverse {
+		it.seekReverse(root)
+	} else {
+		it.seek(root, lower)
+	}
 	it.advance()
 	return it
 }
@@ -76,12 +86,22 @@ func (it *Iterator) seek(n *node, lower []byte) {
 	}
 }
 
+// seekReverse descends the tree pushing every node whose key is < upper, so the
+// top of the stack becomes the largest in-range key.
+func (it *Iterator) seekReverse(n *node) {
+	for n != nil {
+		if it.upper == nil || bytes.Compare(n.key, it.upper) < 0 {
+			it.stack = append(it.stack, n)
+			n = n.right
+		} else {
+			n = n.left
+		}
+	}
+}
+
 // pop returns the next node in ascending order and prepares the stack for the
 // one after it.
 func (it *Iterator) pop() *node {
-	if len(it.stack) == 0 {
-		return nil
-	}
 	n := it.stack[len(it.stack)-1]
 	it.stack = it.stack[:len(it.stack)-1]
 	for r := n.right; r != nil; r = r.left {
@@ -90,17 +110,31 @@ func (it *Iterator) pop() *node {
 	return n
 }
 
+// popReverse returns the next node in descending order and prepares the stack
+// for the one after it.
+func (it *Iterator) popReverse() *node {
+	n := it.stack[len(it.stack)-1]
+	it.stack = it.stack[:len(it.stack)-1]
+	for l := n.left; l != nil; l = l.right {
+		it.stack = append(it.stack, l)
+	}
+	return n
+}
+
 // advance moves cur to the next in-range key, or nil if the range is exhausted.
 func (it *Iterator) advance() {
-	for {
-		n := it.pop()
-		if n == nil {
-			it.cur = nil
-			return
-		}
-		if it.upper != nil && bytes.Compare(n.key, it.upper) >= 0 {
-			it.cur = nil
-			return
+	for len(it.stack) > 0 {
+		var n *node
+		if it.reverse {
+			n = it.popReverse()
+			if it.lower != nil && bytes.Compare(n.key, it.lower) < 0 {
+				break
+			}
+		} else {
+			n = it.pop()
+			if it.upper != nil && bytes.Compare(n.key, it.upper) >= 0 {
+				break
+			}
 		}
 		if len(it.prefix) > 0 && !bytes.HasPrefix(n.key, it.prefix) {
 			continue
@@ -108,6 +142,7 @@ func (it *Iterator) advance() {
 		it.cur = n
 		return
 	}
+	it.cur = nil
 }
 
 // Valid reports whether the iterator is positioned at a key.
