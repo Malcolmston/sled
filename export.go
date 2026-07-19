@@ -249,6 +249,9 @@ type singleByteReader struct {
 	buf [1]byte
 }
 
+// ReadByte implements io.ByteReader, reading and returning a single byte from
+// the underlying reader. It returns the error from the underlying read (for
+// example io.EOF or io.ErrUnexpectedEOF) if a byte cannot be read.
 func (s *singleByteReader) ReadByte() (byte, error) {
 	if _, err := io.ReadFull(s.r, s.buf[:]); err != nil {
 		return 0, err
